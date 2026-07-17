@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/evcc-io/evcc/api"
-	"github.com/evcc-io/evcc/api/implement"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/modbus"
 	"github.com/evcc-io/evcc/util/sponsor"
@@ -33,7 +32,6 @@ import (
 
 // Amperfied charger implementation
 type Amperfied struct {
-	implement.Caps
 	log     *util.Logger
 	conn    *modbus.Connection
 	current uint16
@@ -42,24 +40,27 @@ type Amperfied struct {
 }
 
 const (
-	ampRegChargingState      = 5    // Input
-	ampRegCurrents           = 6    // Input 6,7,8
-	ampRegTemperature        = 9    // Input
-	ampRegVoltages           = 10   // Input 10,11,12
-	ampRegPower              = 14   // Input
-	ampRegEnergy             = 17   // Input
-	ampRegTimeoutConfig      = 257  // Holding
-	ampRegRemoteLock         = 259  // Holding
-	ampRegAmpsConfig         = 261  // Holding
-	ampRegFailSafeConfig     = 262  // Holding
-	ampRegPhaseSwitchControl = 501  // Holding
-	ampRegPhaseSwitchState   = 5001 // Input
-	ampRegRfidUID            = 2002 // Input
+	ampRegChargingState = 5   // Input
+	ampRegCurrents      = 6   // Input 6,7,8
+	ampRegTemperature   = 9   // Input
+	ampRegVoltages      = 10  // Input 10,11,12
+	ampRegPower         = 14  // Input
+	ampRegEnergy        = 17  // Input
+	ampRegTimeoutConfig = 257 // Holding
+	ampRegRemoteLock    = 259 // Holding
+	//ampRegAmpsConfig         = 261  // Holding
+	ampRegFailSafeConfig = 262 // Holding
+	ampRegMaxPowerTarget = 500 // Holding
+	//ampRegPhaseSwitchControl = 501  // Holding
+	//ampRegPhaseSwitchState   = 5001 // Input
+	ampRegRfidUID = 2002 // Input
 )
 
 func init() {
 	registry.AddCtx("amperfied", NewAmperfiedFromConfig)
 }
+
+//go:generate go tool decorate -f decorateAmperfied -b *Amperfied -r api.Charger -t api.PhaseSwitcher,api.PhaseGetter
 
 // NewAmperfiedFromConfig creates a Amperfied charger from generic config
 func NewAmperfiedFromConfig(ctx context.Context, other map[string]any) (api.Charger, error) {
@@ -94,7 +95,6 @@ func NewAmperfied(ctx context.Context, uri string, slaveID uint8, phases bool) (
 	conn.Logger(log.TRACE)
 
 	wb := &Amperfied{
-		Caps:    implement.New(),
 		log:     log,
 		conn:    conn,
 		current: 60, // assume min current
@@ -109,12 +109,14 @@ func NewAmperfied(ctx context.Context, uri string, slaveID uint8, phases bool) (
 		go wb.heartbeat(ctx, time.Duration(u)*time.Millisecond/2)
 	}
 
+	var phases1p3p func(int) error
+	var phasesG func() (int, error)
 	if phases {
-		implement.Has(wb, implement.PhaseSwitcher(wb.phases1p3p))
-		implement.Has(wb, implement.PhaseGetter(wb.getPhases))
+		phases1p3p = wb.phases1p3p
+		phasesG = wb.getPhases
 	}
 
-	return wb, nil
+	return decorateAmperfied(wb, phases1p3p, phasesG), nil
 }
 
 func (wb *Amperfied) heartbeat(ctx context.Context, timeout time.Duration) {
@@ -136,6 +138,18 @@ func (wb *Amperfied) set(reg, val uint16) error {
 	binary.BigEndian.PutUint16(b, val)
 
 	_, err := wb.conn.WriteMultipleRegisters(reg, 1, b)
+
+	return err
+}
+
+// updatePower sends new maximim target power to the wb
+func (wb *Amperfied) updatePower() error {
+	pwr := uint16(float64(wb.current/10) * 230.0 * float64(wb.phases))
+
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, pwr)
+
+	_, err := wb.conn.WriteMultipleRegisters(ampRegMaxPowerTarget, 1, b)
 
 	return err
 }
@@ -187,32 +201,29 @@ func (wb *Amperfied) Status() (api.ChargeStatus, error) {
 
 // Enabled implements the api.Charger interface
 func (wb *Amperfied) Enabled() (bool, error) {
-	b, err := wb.conn.ReadHoldingRegisters(ampRegAmpsConfig, 1)
+	b, err := wb.conn.ReadHoldingRegisters(ampRegMaxPowerTarget, 1)
 	if err != nil {
 		return false, err
 	}
 
-	cur := binary.BigEndian.Uint16(b)
+	pwr := binary.BigEndian.Uint16(b)
 
-	enabled := cur != 0
-	if enabled {
-		wb.current = cur
-	}
+	enabled := pwr != 0
 
 	return enabled, nil
 }
 
 // Enable implements the api.Charger interface
 func (wb *Amperfied) Enable(enable bool) error {
-	var cur uint16
+	var pwr uint16
 	if enable {
-		cur = wb.current
+		pwr = uint16(float64(wb.current/10) * 230.0 * float64(wb.phases))
 	}
 
 	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, cur)
+	binary.BigEndian.PutUint16(b, pwr)
 
-	_, err := wb.conn.WriteMultipleRegisters(ampRegAmpsConfig, 1, b)
+	_, err := wb.conn.WriteMultipleRegisters(ampRegMaxPowerTarget, 1, b)
 
 	return err
 }
@@ -230,17 +241,9 @@ func (wb *Amperfied) MaxCurrentMillis(current float64) error {
 		return fmt.Errorf("invalid current %.1f", current)
 	}
 
-	curr := uint16(10 * current)
+	wb.current = uint16(10 * current)
 
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, curr)
-
-	_, err := wb.conn.WriteMultipleRegisters(ampRegAmpsConfig, 1, b)
-	if err == nil {
-		wb.current = curr
-	}
-
-	return err
+	return wb.updatePower()
 }
 
 var _ api.Meter = (*Amperfied)(nil)
@@ -343,26 +346,16 @@ func (wb *Amperfied) WakeUp() error {
 
 // phases1p3p implements the api.PhaseSwitcher interface
 func (wb *Amperfied) phases1p3p(phases int) error {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, uint16(phases))
+	if phases != 1 && phases != 3 {
+		return fmt.Errorf("invalid phases: %d", phases)
+	}
 
 	wb.phases = phases
-
-	_, err := wb.conn.WriteMultipleRegisters(ampRegPhaseSwitchControl, 1, b)
-	return err
+	return wb.updatePower()
 }
 
 // getPhases implements the api.PhaseGetter interface
 func (wb *Amperfied) getPhases() (int, error) {
-	b, err := wb.conn.ReadInputRegisters(ampRegPhaseSwitchState, 1)
-	if err != nil {
-		return 0, err
-	}
-
-	phases := int(binary.BigEndian.Uint16(b))
-	if phases == 0 {
-		return wb.phases, nil
-	}
-
-	return phases, nil
+	//return setting only, no reading of phase switch state
+	return wb.phases, nil
 }
