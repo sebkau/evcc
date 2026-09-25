@@ -152,7 +152,7 @@ func (suite *mqttSuite) TestMeasurement() {
 
 func (suite *mqttSuite) TestBatteryState() {
 	topics := lo.Map([]string{
-		"power", "energy", "capacity", "soc",
+		"power", "energy", "returnEnergy", "capacity", "soc",
 		"devices", "devices/1/name", "devices/1/title", "devices/1/icon", "devices/1/power", "devices/1/energy", "devices/1/returnEnergy", "devices/1/powers", "devices/1/currents", "devices/1/excessDCPower", "devices/1/capacity", "devices/1/soc", "devices/1/controllable", "devices/1/suggestion",
 		"forecast",
 	}, func(s string, _ int) string {
@@ -169,5 +169,19 @@ func (suite *mqttSuite) TestBatteryState() {
 	})
 
 	suite.Equal(topics, suite.topics, "topics")
-	suite.Equal([]string{"2", "", "", "20", "1", "", "", "", "1", "", "", "", "", "", "", "10", "", "", ""}, suite.payloads, "payloads")
+	suite.Equal([]string{"2", "", "", "", "20", "1", "", "", "", "1", "", "", "", "", "", "", "10", "", "", ""}, suite.payloads, "payloads")
+}
+
+func (suite *mqttSuite) TestMapKeys() {
+	suite.publish("test", false, map[string]int{
+		"HomeAssistant (homeassistant.internal)": 1,
+	})
+	suite.Equal([]string{"test/HomeAssistant_(homeassistant.internal)"}, suite.topics, "topics")
+	suite.Equal([]string{"1"}, suite.payloads, "payloads")
+}
+
+func TestMqttTopicLevel(t *testing.T) {
+	assert.Equal(t, "foo", mqttTopicLevel("foo"))
+	assert.Equal(t, "Tibber_(VW_ID.3,_Cupra)", mqttTopicLevel("Tibber (VW ID.3, Cupra)"))
+	assert.Equal(t, "a_b_c_d", mqttTopicLevel("a+b#c/d"))
 }
